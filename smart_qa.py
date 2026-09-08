@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import warnings
 from dataclasses import dataclass
@@ -93,6 +94,32 @@ SENSITIVE_REJECT_MESSAGE = (
     "请调整您的问题，避免涉及上述敏感隐私数据后重试。"
 )
 
+# ---------------------------------------------------------------------- #
+# 回答后处理：剥离 Agent 最终回答中的冗余内容，只保留核心结论与数据摘要
+# ---------------------------------------------------------------------- #
+
+# ```sql 代码块：SQL 不再随响应回传，回答正文也不重复
+_SQL_FENCE_RE = re.compile(
+    r"```[ \t]*sql[ \t]*\r?\n.*?```[ \t]*(?:\r?\n)?", re.IGNORECASE | re.DOTALL
+)
+
+# 句首过渡语："根据查询结果，" / "查询结果显示：" / "经过统计，" / "数据显示，" 等
+_LEAD_IN_RE = re.compile(
+    r"^(?:根据|经过|通过|依据)?(?:查询|统计|分析|检索)?(?:结果|数据)?(?:显示|表明)?[，,：:\s]+"
+)
+
+# 整行过程叙述："我查询了 users 表。" / "我们先调用 sql_db_schema …"
+_NARRATION_LINE_RE = re.compile(
+    r"^我(?:们)?(?:先|再|又|接着|接下来|然后|已|已经)?"
+    r"(?:调用|查询|检查|执行|获取|查看|使用|编写|校验|检索).*$"
+)
+
+# 整行结尾客套话："希望以上回答对您有帮助。" / "如有疑问请继续提问。" 等
+_CLOSING_LINE_RE = re.compile(
+    r"^(?:希望|欢迎|感谢|如|若|如果|如需)[^。！!？?]{0,40}"
+    r"(?:帮助|疑问|问题|咨询|提问|告知|交流|补充|联系)[^。！!？?]*[。！!？?]?$"
+)
+
 
 def detect_sensitive_question(question: str) -> list[str]:
     """返回用户问题命中的全部敏感隐私关键词（大小写不敏感）。"""
@@ -124,10 +151,16 @@ DEFAULT_SYSTEM_PROMPT = """你是一位资深的数据分析助手"智慧问数"
 - 多表关联查询时，请优先直接使用 `sql_db_schema` 返回的“可关联的表（JOIN 建议）”中给出的 JOIN 子句，不要自行猜测关联字段；
 - 只查询回答问题所需的最少数据，避免 SELECT * 和返回过多行。
 
-最终回答格式（直接用中文回答用户，不要暴露内部思考）：
-- 先用一两句话直接回答用户的问题；
-- 随后给出本次使用的 SQL（用 ```sql 代码块包裹）；
-- 最后简要说明结果情况（共多少行、关键数值或趋势等）。如果未能查出数据，请说明原因。"""
+问题输入选择：
+- 用户消息可能同时给出「用户原始问题」与「上游改写后的独立问题」；
+- 由你判断哪个可以直接使用：改写后的问题指代完整、意图清晰时，优先按它查询与作答；
+- 若改写后的问题明显不可用（表述残缺、与原始问题意图不符），则以原始问题为准；
+- 只给出一个问题时，直接按该问题处理。
+
+最终回答格式（直接用中文回答用户，不要暴露内部思考，保持简洁）：
+- 系统会自动在回答首部嵌入查询结果数据表格、并在前端渲染图表；你只需给出一两句话的核心结论与简要解释（关键数值、趋势等）；
+- 回答中不要包含 ```sql 代码块、Markdown 数据表格、查询过程叙述（如“我调用了某工具”）与客套话（如“希望对您有帮助”）；
+- 如果未能查出数据，请说明原因。"""
 
 
 @dataclass
@@ -253,8 +286,13 @@ class SmartQA:
         self,
         question: str,
         chat_history: list[BaseMessage] | None = None,
+        resolved_question: str | None = None,
     ) -> dict[str, Any]:
         """向数据库提出一个自然语言问题，返回结构化结果。
+
+        resolved_question 为上游指代消解后的独立问题：非空时与
+        question 一并交给智能体，由智能体判断哪个可用作问题输入
+        （见 _compose_user_input）；返回的 question 字段仍为原始问题。
 
         返回字段：
             - question: 原始问题
@@ -270,9 +308,11 @@ class SmartQA:
             - usage:    本次调用的 token 用量与工具调用次数统计
             - duration_ms: Agent 执行耗时（毫秒）
         """
-        # 敏感隐私问题拦截：问题本身命中敏感关键词时直接拒绝，
-        # 不进入 Agent，避免任何 SQL 触碰敏感字段。
-        if detect_sensitive_question(question):
+        # 敏感隐私问题拦截：原始问题或上游改写问题任一命中敏感关键词
+        # 都直接拒绝，不进入 Agent，避免任何 SQL 触碰敏感字段。
+        if detect_sensitive_question(question) or detect_sensitive_question(
+            resolved_question or ""
+        ):
             return {
                 "question": question,
                 "answer": SENSITIVE_REJECT_MESSAGE,
@@ -283,7 +323,9 @@ class SmartQA:
                 "error": None,
             }
 
-        messages: list[BaseMessage] = self._build_messages(question, chat_history)
+        messages: list[BaseMessage] = self._build_messages(
+            question, chat_history, resolved_question
+        )
 
         config = {"recursion_limit": self.recursion_limit}
         if self.verbose:
@@ -303,7 +345,7 @@ class SmartQA:
 
         return {
             "question": question,
-            "answer": self._extract_final_answer(messages_out),
+            "answer": self._postprocess_answer(self._extract_final_answer(messages_out)),
             "sql": self._extract_sql(intermediate_steps),
             "data": self._extract_data(intermediate_steps),
             "suggested_column_aliases": self._extract_column_aliases(intermediate_steps),
@@ -318,6 +360,7 @@ class SmartQA:
         self,
         question: str,
         chat_history: list[BaseMessage] | None = None,
+        resolved_question: str | None = None,
     ):
         """流式提问生成器（P3-15）：边执行边产出事件，消除“白等”。
 
@@ -327,9 +370,12 @@ class SmartQA:
             {"type": "result", "result": {...}}      最终结构化结果（字段同 ask）
 
         敏感拒绝不经过 Agent，直接产出 rejected 的 result 事件；
+        原始问题与上游改写问题任一命中敏感词都会拦截；
         Agent 异常按分层异常上抛，由调用方（Web 层）捕获并转为错误事件。
         """
-        if detect_sensitive_question(question):
+        if detect_sensitive_question(question) or detect_sensitive_question(
+            resolved_question or ""
+        ):
             yield {
                 "type": "result",
                 "result": {
@@ -344,7 +390,7 @@ class SmartQA:
             }
             return
 
-        messages = self._build_messages(question, chat_history)
+        messages = self._build_messages(question, chat_history, resolved_question)
         config = {"recursion_limit": self.recursion_limit}
 
         collected: list[BaseMessage] = []
@@ -381,7 +427,7 @@ class SmartQA:
             "type": "result",
             "result": {
                 "question": question,
-                "answer": self._extract_final_answer(collected),
+                "answer": self._postprocess_answer(self._extract_final_answer(collected)),
                 "sql": self._extract_sql(intermediate_steps),
                 "data": self._extract_data(intermediate_steps),
                 "suggested_column_aliases": self._extract_column_aliases(intermediate_steps),
@@ -397,17 +443,42 @@ class SmartQA:
         """释放数据库连接池。"""
         self.database.close()
 
+    @staticmethod
+    def _compose_user_input(question: str, resolved_question: str | None = None) -> str:
+        """组装交给智能体的问题输入。
+
+        上游完成指代消解时把两个问题一并给出，由智能体判断哪个可用：
+        改写后的独立问题表述完整时优先采用，明显不可用时回退原始问题；
+        未提供（或与原始问题相同）时直接用原始问题。
+        """
+        resolved = (resolved_question or "").strip()
+        original = (question or "").strip()
+        if not resolved or resolved == original:
+            return question
+        return (
+            f"用户原始问题：{question}\n"
+            f"上游改写后的独立问题：{resolved}\n"
+            "请判断哪个问题可以直接使用：改写后的问题指代完整、意图清晰时"
+            "优先按它查询作答；若其明显不可用，则以原始问题为准。"
+        )
+
     def _build_messages(
         self,
         question: str,
         chat_history: list[BaseMessage] | None,
+        resolved_question: str | None = None,
     ) -> list[BaseMessage]:
-        """组装本轮输入消息：历史 + few-shot 示例（P3-16，命中才注入）+ 问题。"""
+        """组装本轮输入消息：历史 + few-shot 示例（P3-16，命中才注入）+ 问题。
+
+        few-shot 检索与 HumanMessage 均用组合后的问题输入：含上游改写
+        问题时两者一并交给智能体判断（见 _compose_user_input）。
+        """
+        user_input = self._compose_user_input(question, resolved_question)
         messages: list[BaseMessage] = list(chat_history or [])
-        few_shot = format_few_shot(retrieve_examples(question))
+        few_shot = format_few_shot(retrieve_examples(user_input))
         if few_shot:
             messages.append(SystemMessage(content=few_shot))
-        messages.append(HumanMessage(content=question))
+        messages.append(HumanMessage(content=user_input))
         return messages
 
     def __enter__(self) -> "SmartQA":
@@ -436,6 +507,39 @@ class SmartQA:
             "output_tokens": output_tokens,
             "tool_calls": tool_calls,
         }
+
+    @staticmethod
+    def _postprocess_answer(answer: str) -> str:
+        """精简 Agent 最终回答：只保留核心结论与数据摘要，适合前端直接展示。
+
+        处理顺序：
+        1. 剥离 ```sql 代码块（SQL 不再随响应回传）；
+        2. 逐行过滤 Markdown 表格行（数据表格由系统统一嵌入，避免重复）、
+           过程叙述与结尾客套话；
+        3. 去除首行句首过渡语（"根据查询结果，" 等）；
+        4. 压缩连续空行。
+        精简后为空时逐级回退到仅剥代码块的文本、原文，避免返回空回答。
+        """
+        text = (answer or "").strip()
+        if not text:
+            return ""
+        without_sql = _SQL_FENCE_RE.sub("", text)
+        lines = [
+            stripped
+            for stripped in (line.strip() for line in without_sql.splitlines())
+            if stripped
+            and not stripped.startswith("|")
+            and not _NARRATION_LINE_RE.match(stripped)
+            and not _CLOSING_LINE_RE.match(stripped)
+        ]
+        if lines:
+            first = _LEAD_IN_RE.sub("", lines[0], 1).strip()
+            lines = [first] + lines[1:] if first else lines[1:]
+        cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        if cleaned:
+            return cleaned
+        fallback = re.sub(r"\n{3,}", "\n\n", without_sql).strip()
+        return fallback or text
 
     @staticmethod
     def _extract_steps_from_messages(

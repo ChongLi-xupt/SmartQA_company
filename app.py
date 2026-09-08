@@ -2,7 +2,7 @@
 
 接口说明：
     GET  /                  前端页面（templates/index.html）
-    POST /api/v1/ask        提交自然语言问题，返回回答 / SQL / 数据 / 图表建议
+    POST /api/v1/ask        提交自然语言问题，返回回答（含数据表格）/ 数据 / 图表建议
     POST /api/v1/ask_stream 同上，但以 SSE 流式推送工具步骤与最终结果（P3-15）
     POST /api/v1/new_chat   创建全新会话并切换（侧边栏「新对话」）
     POST /api/v1/feedback   提交回答评价（👍/👎），沉淀到 feedback.jsonl（P3-18）
@@ -54,7 +54,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from itsdangerous import BadSignature, URLSafeTimedSerializer
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -227,25 +227,6 @@ def _get_history(session_id: str):
     return _history_store.get(session_id)
 
 
-def _summarize_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """精简工具调用过程，避免把超长输出传给前端。"""
-    summarized = []
-    for step in steps:
-        output = step.get("output")
-        if not isinstance(output, str):
-            output = str(output)
-        if len(output) > 300:
-            output = output[:300] + " …(已截断)"
-        summarized.append(
-            {
-                "tool": step.get("tool"),
-                "input": step.get("input"),
-                "output": output,
-            }
-        )
-    return summarized
-
-
 # ---------------------------------------------------------------------- #
 # 接口限流：按客户端 IP 的滑动窗口计数（线程安全，无外部依赖）。
 # 多实例部署时建议替换为共享存储限流。
@@ -396,6 +377,8 @@ _MAX_QUESTION_LENGTH = 500
 _MAX_SESSION_ID_LENGTH = 64
 # 用户 ID 长度上限：前端自动生成或业务系统下发的用户标识
 _MAX_USER_ID_LENGTH = 64
+# 上游透传标识（request_id/conversation_id/turn_id/trace_id）长度上限
+_MAX_PASSTHROUGH_ID_LENGTH = 128
 
 
 # ---------------------------------------------------------------------- #
@@ -404,12 +387,28 @@ _MAX_USER_ID_LENGTH = 64
 
 
 class AskRequest(BaseModel):
-    """POST /ask 与 /ask_stream 的请求体。"""
+    """POST /ask 与 /ask_stream 的请求体。
+
+    上游集成契约：question 为用户原始问题；resolved_question 为上游完成
+    指代消解后的独立问题，非空时与 question 一并交给智能体，由智能体
+    判断哪个可用作问题输入；其余标识字段
+    （request_id/conversation_id/turn_id/trace_id/user_id）为透传参数，
+    不参与查询逻辑，响应中原封不动回显。
+    """
 
     question: str
+    # 上游指代消解结果：与 question 一并交给智能体判断取舍（空串归一为 None）
+    resolved_question: str | None = None
     # 用户标识：前端自动生成或业务系统下发，用于会话归属与按用户隔离展示；
     # 可选字段，不传按匿名处理（向后兼容旧客户端）
     user_id: str = ""
+    # 上游透传标识：仅回显，不参与查询逻辑
+    request_id: str | None = Field(default=None, max_length=_MAX_PASSTHROUGH_ID_LENGTH)
+    conversation_id: str | None = Field(
+        default=None, max_length=_MAX_PASSTHROUGH_ID_LENGTH
+    )
+    turn_id: str | None = Field(default=None, max_length=_MAX_PASSTHROUGH_ID_LENGTH)
+    trace_id: str | None = Field(default=None, max_length=_MAX_PASSTHROUGH_ID_LENGTH)
 
     @field_validator("question")
     @classmethod
@@ -420,6 +419,18 @@ class AskRequest(BaseModel):
         if len(value) > _MAX_QUESTION_LENGTH:
             raise ValueError(
                 f"问题过长（上限 {_MAX_QUESTION_LENGTH} 字），请精简后重试。"
+            )
+        return value
+
+    @field_validator("resolved_question")
+    @classmethod
+    def _validate_resolved_question(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+        if len(value) > _MAX_QUESTION_LENGTH:
+            raise ValueError(
+                f"resolved_question 过长（上限 {_MAX_QUESTION_LENGTH} 字），请精简后重试。"
             )
         return value
 
@@ -584,8 +595,8 @@ api_router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_api_key)]
 def _finalize_result(
     session_id: str, question: str, result: dict[str, Any], user_id: str = ""
 ) -> None:
-    """提问完成后的公共收尾：写会话历史（完整 payload）+ token/耗时日志。"""
-    # 成功的回答写入会话历史：完整 payload 供侧边栏回放，
+    """提问完成后的公共收尾：写会话历史（精简 payload）+ token/耗时日志。"""
+    # 成功的回答写入会话历史：精简 payload 供侧边栏回放，
     # LLM 上下文由存储层按 HISTORY_MAX_MESSAGES 截取；
     # user_id 随首次写入绑定会话归属，供会话列表按用户隔离展示
     if result.get("error") is None and not result.get("rejected"):
@@ -606,33 +617,105 @@ def _finalize_result(
         )
 
 
-def _build_ask_payload(question: str, result: dict[str, Any]) -> dict[str, Any]:
-    """组装 /ask 与 /ask_stream 共用的最终响应体（数据 + 图表 + 精简步骤）。
+# 回答内嵌数据表格的行数上限：足以展示概览，又避免超长表格
+# 撑大回答体积与多轮对话的 LLM 上下文
+_ANSWER_TABLE_MAX_ROWS = 20
+
+
+def _markdown_data_table(
+    columns: list[str], rows: list[list[Any]], aliases: dict[str, str]
+) -> str:
+    """把查询结果渲染为 Markdown 表格，供嵌入回答正文首部。
+
+    列头优先中文别名；单元格内的竖线/换行转义以免破坏表格结构；
+    无列或无行时返回空串（如敏感拒绝、查询无结果）。
+    """
+    if not columns or not rows:
+        return ""
+    lines = [
+        "| " + " | ".join(aliases.get(column) or column for column in columns) + " |",
+        "|" + "---|" * len(columns),
+    ]
+    for row in rows[:_ANSWER_TABLE_MAX_ROWS]:
+        cells = []
+        for index in range(len(columns)):
+            value = row[index] if index < len(row) else ""
+            text = "" if value is None else str(value)
+            cells.append(text.replace("|", "\\|").replace("\n", " "))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+# 上游透传参数（总项目集成契约）：响应中原封不动回显，不参与查询逻辑；
+# 仅回显请求中实际携带的字段，避免未传字段以 null 占位
+_PASSTHROUGH_FIELDS = (
+    "request_id",
+    "conversation_id",
+    "turn_id",
+    "trace_id",
+    "user_id",
+    "resolved_question",
+)
+
+
+def _merge_passthrough(
+    payload: dict[str, Any], request_body: AskRequest
+) -> dict[str, Any]:
+    """把请求携带的透传参数原样写回响应体（就地修改并返回 payload）。"""
+    for field in _PASSTHROUGH_FIELDS:
+        value = getattr(request_body, field, None)
+        if value:
+            payload[field] = value
+    return payload
+
+
+def _build_ask_payload(
+    question: str, result: dict[str, Any], query_question: str | None = None
+) -> dict[str, Any]:
+    """组装 /ask 与 /ask_stream 共用的最终响应体（精简结构）。
+
+    只保留问答结果与绘图数据：question / answer / data / chart。
+    answer 正文按「数据表格 → 简短解释」组织：表格由查询结果确定性
+    渲染（≤ _ANSWER_TABLE_MAX_ROWS 行，列头优先中文别名），解释为
+    Agent 经后处理的精简回答；图表由前端依据 chart/data 在回答之后渲染。
+    SQL、工具调用过程不再回传（流式步骤已由 SSE step_start/step_done
+    实时透出）；token 用量与耗时只进服务端日志（见 _finalize_result）；
+    失败路径由全局异常处理器统一返回 {"ok": false, "error": ...}。
 
     data.column_aliases 为列名中文别名表：Agent 上报建议优先、
     config/column_aliases.yaml 配置兜底；前端图表图例/坐标轴/表头
     优先渲染别名，无别名时回退原始列名。
+
+    question 为回显/写入历史的原始问题；query_question 为上游消解后的
+    完整问题（如有），仅用于图表推荐；实际以哪个问题作答由智能体
+    判断（见 SmartQA._compose_user_input）。
     """
     data = result.get("data") or {}
     columns = data.get("columns") or []
     rows = data.get("rows") or []
+    aliases = merge_column_aliases(columns, result.get("suggested_column_aliases"))
+
+    answer = result.get("answer") or ""
+    table = _markdown_data_table(columns, rows, aliases)
+    if table:
+        if len(rows) > _ANSWER_TABLE_MAX_ROWS:
+            table += f"\n\n（仅展示前 {_ANSWER_TABLE_MAX_ROWS} 行，共 {len(rows)} 行。）"
+        elif data.get("truncated"):
+            table += "\n\n（查询结果过多，后端已截断。）"
+        answer = f"{table}\n\n{answer}" if answer else table
+
     return {
         "ok": True,
         "question": question,
-        "answer": result.get("answer") or "",
-        "sql": result.get("sql"),
-        "error": None,
+        "answer": answer,
         "data": {
             "columns": columns,
-            "column_aliases": merge_column_aliases(
-                columns, result.get("suggested_column_aliases")
-            ),
+            "column_aliases": aliases,
             "rows": rows,
             "row_count": data.get("row_count", len(rows)),
             "truncated": data.get("truncated", False),
         },
-        "chart": recommend_chart(question, columns, rows),
-        "steps": _summarize_steps(result.get("intermediate_steps") or []),
+        "chart": recommend_chart(query_question or question, columns, rows),
     }
 
 
@@ -646,8 +729,15 @@ def ask(
     payload: AskRequest,
     session_id: str = Depends(get_session_id),
 ) -> dict[str, Any]:
-    """接收自然语言问题，携带当前会话历史调用 Agent 并返回结构化结果。"""
+    """接收自然语言问题，携带当前会话历史调用 Agent 并返回结构化结果。
+
+    question 与上游改写后的 resolved_question 一并交给智能体，由智能体
+    判断哪个可用作问题输入；回答/历史/回显仍用原始 question；
+    透传参数原封不动回显。
+    """
     question = payload.question
+    # 图表推荐按消解后的完整问题判断（如有）：指代已展开，关键词更准
+    query_question = payload.resolved_question or question
     history = _get_history(session_id)
 
     # 并发名额先于 Agent 获取：满员时快速失败，不占用后续任何资源；
@@ -655,11 +745,15 @@ def ask(
     if not _acquire_llm_slot():
         raise StarletteHTTPException(status_code=503, detail=_LLM_BUSY_MESSAGE)
     try:
-        result = get_qa().ask(question, chat_history=history)
+        result = get_qa().ask(
+            question, chat_history=history, resolved_question=payload.resolved_question
+        )
     finally:
         _release_llm_slot()
     _finalize_result(session_id, question, result, user_id=payload.user_id)
-    return _build_ask_payload(question, result)
+    return _merge_passthrough(
+        _build_ask_payload(question, result, query_question), payload
+    )
 
 
 @api_router.post("/ask_stream", dependencies=[Depends(_ask_rate_limit)])
@@ -674,6 +768,8 @@ def ask_stream(
     每条事件形如 ``data: <JSON>\\n\\n``。
     """
     question = payload.question
+    # 图表推荐按消解后的完整问题判断（如有）；智能体自行取舍问题输入
+    query_question = payload.resolved_question or question
     history = _get_history(session_id)
 
     def generate():
@@ -683,12 +779,20 @@ def ask_stream(
             yield _sse({"type": "error", "error": _LLM_BUSY_MESSAGE})
             return
         try:
-            for event in get_qa().ask_stream(question, chat_history=history):
+            for event in get_qa().ask_stream(
+                question, chat_history=history, resolved_question=payload.resolved_question
+            ):
                 if event.get("type") == "result":
                     result = event["result"]
                     _finalize_result(session_id, question, result, user_id=payload.user_id)
                     yield _sse(
-                        {"type": "result", "payload": _build_ask_payload(question, result)}
+                        {
+                            "type": "result",
+                            "payload": _merge_passthrough(
+                                _build_ask_payload(question, result, query_question),
+                                payload,
+                            ),
+                        }
                     )
                 else:
                     yield _sse(event)

@@ -172,23 +172,20 @@ def test_api_key_enforced_when_configured():
 # ------------------------------ P4：历史会话侧边栏 ------------------------------ #
 
 
-def _seed_payload(question: str, answer: str, sql: str | None) -> dict:
-    """构造一轮完整回答 payload（结构与 /ask 响应一致）。"""
+def _seed_payload(question: str, answer: str) -> dict:
+    """构造一轮完整回答 payload（结构与精简后的 /ask 响应一致）。"""
     return {
         "ok": True,
         "question": question,
         "answer": answer,
-        "sql": sql,
-        "error": None,
-        "data": {"columns": [], "rows": [], "row_count": 0, "truncated": False},
+        "data": {"columns": [], "column_aliases": {}, "rows": [], "row_count": 0, "truncated": False},
         "chart": {"chartable": False, "chart_type": None, "reason": "", "column_kinds": []},
-        "steps": [],
     }
 
 
 def _seed_session(session_id: str = "testsession123"):
     app._history_store.append(
-        session_id, "一共有多少用户？", _seed_payload("一共有多少用户？", "共 100 个用户。", "SELECT COUNT(*) FROM user")
+        session_id, "一共有多少用户？", _seed_payload("一共有多少用户？", "共 100 个用户。")
     )
     return session_id
 
@@ -222,7 +219,6 @@ def test_session_messages_full_replay():
         assert messages[0]["content"] == "一共有多少用户？"
         assert messages[1]["role"] == "assistant"
         assert messages[1]["payload"]["answer"] == "共 100 个用户。"
-        assert messages[1]["payload"]["sql"] == "SELECT COUNT(*) FROM user"
     finally:
         app._history_store.delete_session(session_id)
 
@@ -269,8 +265,8 @@ def test_sessions_reject_invalid_session_id():
 
 def test_sessions_filtered_by_user_id():
     # 不同用户的会话隔离展示：/sessions?user_id=xxx 仅返回该用户的会话
-    app._history_store.append("user-a-session", "alice 的问题", _seed_payload("alice 的问题", "回答A", None), user_id="alice")
-    app._history_store.append("user-b-session", "bob 的问题", _seed_payload("bob 的问题", "回答B", None), user_id="bob")
+    app._history_store.append("user-a-session", "alice 的问题", _seed_payload("alice 的问题", "回答A"), user_id="alice")
+    app._history_store.append("user-b-session", "bob 的问题", _seed_payload("bob 的问题", "回答B"), user_id="bob")
     try:
         response = _client.get("/api/v1/sessions", params={"user_id": "alice"})
         assert response.status_code == 200
@@ -291,6 +287,141 @@ def test_ask_rejects_overlong_user_id():
     )
     assert response.status_code == 400
     assert "user_id" in response.json()["error"]
+
+
+# ---------------- 上游集成：双问题交给智能体与透传回显 ---------------- #
+
+
+class _FakeQA:
+    """捕获问题输入的测试桩（不依赖 LLM/数据库）。"""
+
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    def ask(self, question, chat_history=None, resolved_question=None):
+        self._captured["question"] = question
+        self._captured["resolved_question"] = resolved_question
+        return {
+            "answer": "商品A 总销量最高。",
+            "sql": None,
+            "data": {
+                "columns": ["name"],
+                "rows": [["商品A"]],
+                "row_count": 1,
+                "truncated": False,
+            },
+            "intermediate_steps": [],
+        }
+
+
+def test_compose_user_input_leaves_choice_to_agent():
+    # 两个问题一并交给智能体判断取舍；未提供/相同时直接用原始问题
+    from smart_qa import SmartQA
+
+    assert SmartQA._compose_user_input("一共有多少用户？", None) == "一共有多少用户？"
+    assert SmartQA._compose_user_input("一共有多少用户？", "一共有多少用户？") == "一共有多少用户？"
+    composed = SmartQA._compose_user_input(
+        "其中哪个销量最高？", "在刚才查询的销量最高前10个商品中，哪个商品的总销量最高？"
+    )
+    assert "用户原始问题：其中哪个销量最高？" in composed
+    assert "上游改写后的独立问题：在刚才查询的销量最高前10个商品中" in composed
+    assert "请判断哪个问题可以直接使用" in composed
+
+
+def test_ask_passes_both_questions_and_echoes_passthrough(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(app, "get_qa", lambda: _FakeQA(captured))
+    session_id = _client.post("/api/v1/new_chat").json()["session_id"]
+    resolved = "在刚才查询的销量最高前10个商品中，哪个商品的总销量最高？"
+    try:
+        response = _client.post(
+            "/api/v1/ask",
+            json={
+                "request_id": "REQ001",
+                "conversation_id": "C001",
+                "turn_id": "T001",
+                "trace_id": "TR001",
+                "user_id": "001",
+                "question": "其中哪个销量最高？",
+                "resolved_question": resolved,
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        # 原始问题与改写问题一并下传，由智能体判断哪个可用作输入
+        assert captured["question"] == "其中哪个销量最高？"
+        assert captured["resolved_question"] == resolved
+        assert payload["ok"] is True
+        assert payload["question"] == "其中哪个销量最高？"
+        # 透传参数原封不动回显
+        assert payload["request_id"] == "REQ001"
+        assert payload["conversation_id"] == "C001"
+        assert payload["turn_id"] == "T001"
+        assert payload["trace_id"] == "TR001"
+        assert payload["user_id"] == "001"
+        assert payload["resolved_question"] == resolved
+    finally:
+        app._history_store.delete_session(session_id)
+
+
+def test_ask_without_new_fields_stays_slim(monkeypatch):
+    # 未携带透传参数的旧客户端：响应不出现 null 占位字段
+    captured = {}
+    monkeypatch.setattr(app, "get_qa", lambda: _FakeQA(captured))
+    session_id = _client.post("/api/v1/new_chat").json()["session_id"]
+    try:
+        response = _client.post("/api/v1/ask", json={"question": "一共有多少用户？"})
+        payload = response.json()
+        assert captured["question"] == "一共有多少用户？"
+        assert captured["resolved_question"] is None
+        for field in (
+            "request_id", "conversation_id", "turn_id",
+            "trace_id", "user_id", "resolved_question",
+        ):
+            assert field not in payload
+    finally:
+        app._history_store.delete_session(session_id)
+
+
+def test_ask_sensitive_resolved_question_rejected():
+    # 消解后的问题命中敏感词同样在 Agent 前拦截，透传参数照常回显
+    response = _client.post(
+        "/api/v1/ask",
+        json={
+            "question": "帮我看看",
+            "resolved_question": "查询所有用户的密码",
+            "request_id": "REQ002",
+        },
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert "敏感" in payload["answer"] or "隐私" in payload["answer"]
+    assert payload["request_id"] == "REQ002"
+
+
+def test_ask_resolved_question_length_limit():
+    response = _client.post(
+        "/api/v1/ask",
+        json={"question": "你好", "resolved_question": "长" * 600},
+    )
+    assert response.status_code == 400
+    assert "resolved_question" in response.json()["error"]
+
+
+def test_ask_stream_echoes_passthrough():
+    # SSE 流式 result 事件同样回显透传参数（敏感拦截路径不依赖外部服务）
+    response = _client.post(
+        "/api/v1/ask_stream",
+        json={
+            "question": "查询所有用户的密码",
+            "request_id": "REQ003",
+            "trace_id": "TR003",
+        },
+    )
+    assert response.status_code == 200
+    assert '"request_id": "REQ003"' in response.text
+    assert '"trace_id": "TR003"' in response.text
 
 
 # ------------------------------ 列中文别名注入 ------------------------------ #
@@ -335,6 +466,72 @@ def test_build_ask_payload_prefers_agent_aliases():
     }
     payload = app._build_ask_payload("分析一下销售额", result)
     assert payload["data"]["column_aliases"]["total_sales"] == "销售额"
+
+
+def test_build_ask_payload_slim_structure():
+    # 响应体只保留问答结果与绘图数据：SQL/过程/用量/耗时/错误占位一律不回传
+    result = {
+        "answer": "总销售额 100 元。",
+        "sql": "SELECT SUM(pay_amount) AS total_sales FROM orders",
+        "data": {
+            "columns": ["total_sales"],
+            "rows": [[100]],
+            "row_count": 1,
+            "truncated": False,
+        },
+        "intermediate_steps": [
+            {"tool": "sql_db_execute", "input": {"query": "SELECT 1"}, "output": "x" * 400}
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "tool_calls": 3},
+        "duration_ms": 1234,
+    }
+    payload = app._build_ask_payload("销售额是多少？", result)
+    assert set(payload) == {"ok", "question", "answer", "data", "chart"}
+    assert set(payload["data"]) == {
+        "columns", "column_aliases", "rows", "row_count", "truncated"
+    }
+    assert set(payload["chart"]) == {"chartable", "chart_type", "reason", "column_kinds"}
+    # 回答正文按「数据表格 → 简短解释」组织，表头优先中文别名
+    assert payload["answer"].startswith("| 总销售额 |\n|---|\n| 100 |")
+    assert payload["answer"].endswith("总销售额 100 元。")
+
+
+def test_build_ask_payload_answer_table_row_cap():
+    # 内嵌表格最多 20 行，超出附行数提示，避免撑大回答
+    result = {
+        "answer": "共 50 行。",
+        "data": {
+            "columns": ["n"],
+            "rows": [[i] for i in range(50)],
+            "row_count": 50,
+            "truncated": False,
+        },
+        "intermediate_steps": [],
+    }
+    payload = app._build_ask_payload("有多少行？", result)
+    table_lines = [line for line in payload["answer"].splitlines() if line.startswith("|")]
+    assert len(table_lines) == 22  # 表头 + 分隔行 + 20 数据行
+    assert "仅展示前 20 行，共 50 行。" in payload["answer"]
+
+
+def test_postprocess_answer_keeps_conclusion_only():
+    # 回答后处理：剥离 sql 代码块、Markdown 表格、过程叙述与结尾客套，只留核心结论
+    from smart_qa import SmartQA
+
+    raw = (
+        "根据查询结果，最近 7 天共新增 100 个用户。\n"
+        "```sql\nSELECT COUNT(*) FROM users\n```\n"
+        "我查询了 users 表并统计了数量。\n"
+        "希望以上回答对您有帮助。"
+    )
+    assert SmartQA._postprocess_answer(raw) == "最近 7 天共新增 100 个用户。"
+    # 模型自行输出的数据表格由系统统一嵌入，后处理剥离避免重复
+    raw_table = "| 子阵 | 发电量 |\n|---|---|\n| C03 | 285600 |\n子阵C03 表现最优。"
+    assert SmartQA._postprocess_answer(raw_table) == "子阵C03 表现最优。"
+    # 正常结论不被误伤
+    assert SmartQA._postprocess_answer("共 1,234 个用户。") == "共 1,234 个用户。"
+    # 全文仅 sql 代码块时回退原文，不返回空回答
+    assert SmartQA._postprocess_answer("```sql\nSELECT 1\n```") == "```sql\nSELECT 1\n```"
 
 
 def test_extract_column_aliases_from_steps():

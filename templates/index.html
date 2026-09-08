@@ -260,45 +260,6 @@
 
         .chart-box { width: 100%; height: 340px; }
 
-        /* ---------- 折叠面板（SQL / 数据 / 过程） ---------- */
-        details { margin-top: 10px; border-top: 1px dashed #e5e7eb; padding-top: 8px; }
-        details summary {
-            cursor: pointer;
-            font-size: 13px;
-            color: #2a5298;
-            font-weight: 600;
-            user-select: none;
-        }
-        details pre.sql-block {
-            background: #0f172a;
-            color: #7dd3fc;
-            padding: 10px 12px;
-            border-radius: 6px;
-            overflow-x: auto;
-            font-size: 12.5px;
-            margin-top: 8px;
-        }
-
-        .data-table-wrap { overflow-x: auto; margin-top: 8px; max-height: 260px; overflow-y: auto; }
-        .data-table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
-        .data-table th {
-            background: #2a5298;
-            color: #fff;
-            position: sticky;
-            top: 0;
-        }
-        .data-table th, .data-table td {
-            border: 1px solid #e5e7eb;
-            padding: 5px 10px;
-            text-align: left;
-            white-space: nowrap;
-        }
-        .data-table tr:nth-child(even) td { background: #f8fafc; }
-
-        .steps-list { font-size: 12.5px; color: #475569; margin-top: 8px; padding-left: 4px; }
-        .steps-list li { margin-bottom: 6px; line-height: 1.6; }
-        .steps-list .tool-name { color: #2a5298; font-weight: 600; }
-
         /* ---------- 加载动画 ---------- */
         .typing { display: inline-flex; gap: 5px; padding: 4px 0; }
         .typing i {
@@ -616,44 +577,7 @@
             return div;
         }
 
-        function buildDataTable(columns, rows, truncated, names) {
-            const maxRows = 100;
-            const shown = rows.slice(0, maxRows);
-            let html = '<div class="data-table-wrap"><table class="data-table"><thead><tr>';
-            // 列头优先中文别名；title 保留原始字段名便于核对 SQL
-            columns.forEach((c, i) => {
-                const label = (names && names[i]) ? names[i] : c;
-                html += '<th title="' + escapeHtml(c) + '">' + escapeHtml(label) + '</th>';
-            });
-            html += '</tr></thead><tbody>';
-            shown.forEach(r => {
-                html += '<tr>';
-                columns.forEach((_, i) => { html += '<td>' + escapeHtml(r[i]) + '</td>'; });
-                html += '</tr>';
-            });
-            html += '</tbody></table></div>';
-            if (rows.length > maxRows) {
-                html += '<div class="input-tip">仅展示前 ' + maxRows + ' 行，共 ' + rows.length + ' 行。</div>';
-            } else if (truncated) {
-                html += '<div class="input-tip">查询结果过多，已截断。</div>';
-            }
-            return html;
-        }
-
-        function buildStepsHtml(steps) {
-            if (!steps || !steps.length) return '';
-            let html = '<ol class="steps-list">';
-            steps.forEach(s => {
-                const input = typeof s.input === 'object' ? JSON.stringify(s.input) : String(s.input ?? '');
-                html += '<li><span class="tool-name">' + escapeHtml(toolLabel(s.tool)) + '</span>' +
-                    '<br>输入: ' + escapeHtml(input) +
-                    '<br>输出: ' + escapeHtml(s.output) + '</li>';
-            });
-            html += '</ol>';
-            return html;
-        }
-
-        /** 构建一条完整的机器人回复 DOM（回答 + 图表 + SQL + 数据 + 过程 + 反馈）。
+        /** 构建一条完整的机器人回复 DOM（回答[含数据表格] + 图表 + 反馈）。
          *  实时渲染与历史回放共用；XSS 基线：所有动态内容均转义/净化。 */
         function buildBotMessage(payload) {
             const div = document.createElement('div');
@@ -688,25 +612,7 @@
                     '</div>';
             }
 
-            // 3. SQL
-            if (payload.sql) {
-                inner += '<details><summary>查看 SQL</summary>' +
-                    '<pre class="sql-block">' + escapeHtml(payload.sql) + '</pre></details>';
-            }
-
-            // 4. 数据表
-            if (data.columns && data.columns.length) {
-                inner += '<details><summary>查看数据（' + data.row_count + ' 行）</summary>' +
-                    buildDataTable(data.columns, data.rows, data.truncated, displayNames(data)) + '</details>';
-            }
-
-            // 5. 工具调用过程
-            if (payload.steps && payload.steps.length) {
-                inner += '<details><summary>查看执行过程</summary>' +
-                    buildStepsHtml(payload.steps) + '</details>';
-            }
-
-            // 6. 反馈按钮（P3-18）
+            // 3. 反馈按钮（P3-18）
             inner += '<div class="feedback">' +
                 '<button class="feedback-btn" data-rating="up">👍 有用</button>' +
                 '<button class="feedback-btn" data-rating="down">👎 无用</button>' +
@@ -947,7 +853,6 @@
                     body: JSON.stringify({
                         rating,
                         question: payload.question,
-                        sql: payload.sql || null,
                         user_id: USER_ID,
                     }),
                 });

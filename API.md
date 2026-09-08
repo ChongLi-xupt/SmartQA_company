@@ -1,7 +1,7 @@
 # 智慧问数系统 API 接口文档
 
 - **服务版本**:v0.4.0(FastAPI)
-- **文档更新日期**:2026-08-26
+- **文档更新日期**:2026-09-02
 - **接口基址**:`http://<host>:<port>`
 - **数据格式**:请求/响应均为 `application/json`(UTF-8);SSE 接口为 `text/event-stream`
 
@@ -104,7 +104,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 
 #### POST /api/v1/ask
 
-提交自然语言问题,携带当前会话历史调用 Agent,返回回答 / SQL / 数据 / 图表建议。
+提交自然语言问题,携带当前会话历史调用 Agent,返回回答(内嵌数据表格 + 简短解释) / 数据 / 图表建议。
 
 - **认证**:需要(`X-API-Key`,未配置 `WEB_API_KEYS` 时免)
 - **限流**:`RATE_LIMIT_ASK`(默认 20 次/分钟)
@@ -113,7 +113,29 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
   | 字段 | 类型 | 必填 | 校验规则 |
   |---|---|---|---|
   | `question` | string | 是 | strip 后非空;长度 ≤ 500 字 |
+  | `resolved_question` | string \| null | 否 | 上游指代消解后的独立问题,strip 后非空且 ≤ 500 字;非空时与 `question` 一并交给智能体,**由智能体判断哪个可用作问题输入**(空串视同未传) |
   | `user_id` | string | 否 | strip 后长度 ≤ 64 字;不传按匿名处理(向后兼容旧客户端) |
+  | `request_id` | string \| null | 否 | 上游透传标识,≤ 128 字,响应中原封不动回显 |
+  | `conversation_id` | string \| null | 否 | 同上 |
+  | `turn_id` | string \| null | 否 | 同上 |
+  | `trace_id` | string \| null | 否 | 同上 |
+
+  请求示例(总项目集成契约):
+
+  ```json
+  {
+    "request_id": "REQ001",
+    "conversation_id": "C001",
+    "turn_id": "T001",
+    "trace_id": "TR001",
+    "user_id": "001",
+    "question": "其中哪个销量最高？",
+    "resolved_question": "在刚才查询的销量最高前10个商品中，哪个商品的总销量最高？"
+  }
+  ```
+
+  - **问题选择**:`resolved_question` 非空时与 `question` 一并交给智能体,由智能体判断哪个可以直接使用(改写问题指代完整、意图清晰时优先按它作答,明显不可用时回退原始问题);敏感词拦截对两个问题同时生效;回答/历史/回显的 `question` 字段始终为用户原始问题
+  - **透传回显**:`request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question` 不参与查询逻辑,请求携带时在响应中原封不动回显(未携带的字段不出现,不以 null 占位)
 
   `user_id` 为用户标识(前端自动生成或业务系统下发),首轮问答成功写入历史时把会话归属到该用户(归属首次写入即固定,不可被后续请求改挂);会话列表接口可据此按用户隔离展示(见 2.3)。
 
@@ -123,15 +145,18 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
   {"ok": false, "error": "请求参数不合法（question: 问题不能为空。）。"}
   ```
 
-- **成功响应**(`200`,结构同 SSE `result` 事件的 payload):
+- **成功响应**(`200`,结构同 SSE `result` 事件的 payload;只保留问答结果与绘图数据):
 
   ```json
   {
     "ok": true,
+    "request_id": "REQ001",
+    "conversation_id": "C001",
+    "turn_id": "T001",
+    "trace_id": "TR001",
+    "user_id": "001",
     "question": "最近 7 天每天新增多少用户？",
-    "answer": "根据查询结果，最近 7 天每天新增用户数如下……",
-    "sql": "SELECT DATE(create_time) AS d, COUNT(*) FROM users WHERE ... GROUP BY d",
-    "error": null,
+    "answer": "| 日期 | 用户数 |\n|---|---|\n| 2026-08-12 | 156 |\n| 2026-08-13 | 203 |\n\n最近 7 天共新增 1,024 个用户，其中 2026-08-13 新增最多（203 个）。",
     "data": {
       "columns": ["d", "user_count"],
       "column_aliases": {"d": "日期", "user_count": "用户数"},
@@ -144,14 +169,14 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
       "chart_type": "bar",
       "reason": "时间趋势类问题，适合柱状图展示",
       "column_kinds": ["date", "number"]
-    },
-    "steps": [
-      {"tool": "sql_db_schema", "input": {"table": "users"}, "output": "…（截断到 300 字）"}
-    ]
+    }
   }
   ```
 
-- **敏感拦截**(命中敏感词,`200` 但不执行查询、不写入历史):`answer` 为固定拒绝文案,`sql`/`data` 为空(见附录 6.1)
+- **回答正文结构**:`answer` 按「数据表格 → 简短解释」组织——首部为查询结果渲染的 Markdown 表格(最多 20 行,列头优先中文别名,超出附行数提示),其后为 Agent 精简后的核心结论;图表由前端依据 `chart`/`data` 在回答之后渲染,整体呈现「表格 → 解释 → 绘图」顺序
+- **精简约定**:响应体不再携带 SQL、工具调用过程(`steps`)、token 用量与耗时(后两者仅记服务端日志,见 6.3);流式步骤由 SSE `step_start`/`step_done` 事件实时透出;失败时不回此体,统一走 1.5 错误结构(**`error` 字段仅出错时出现**);示例中的 `request_id` 等透传字段仅在请求携带时回显
+
+- **敏感拦截**(命中敏感词,`200` 但不执行查询、不写入历史):`answer` 为固定拒绝文案,`data` 为空结构(见附录 6.1)
 - **错误响应**:LLM 故障 `502`、数据库故障 `503`、限流 `429`,结构见 1.5
 
 #### POST /api/v1/ask_stream
@@ -240,7 +265,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
       {
         "role": "assistant",
         "content": "共有 1,234 个用户。",
-        "payload": { "ok": true, "question": "...", "answer": "...", "sql": "...", "error": null, "data": {...}, "chart": {...}, "steps": [...] },
+        "payload": { "ok": true, "question": "...", "answer": "...", "data": {...}, "chart": {...} },
         "ts": "2026-08-18T09:09:00.123456+00:00"
       }
     ]
@@ -334,7 +359,12 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 ```json
 {
   "question": "string，必填，strip 后非空且 ≤ 500 字",
-  "user_id": "string，可选，用户标识，≤ 64 字，不传按匿名处理"
+  "resolved_question": "string | null，可选，上游指代消解后的独立问题（≤ 500 字），非空时与 question 一并交给智能体判断取舍",
+  "user_id": "string，可选，用户标识，≤ 64 字，不传按匿名处理",
+  "request_id": "string | null，可选，上游透传标识（≤ 128 字），响应原样回显",
+  "conversation_id": "string | null，可选，同上",
+  "turn_id": "string | null，可选，同上",
+  "trace_id": "string | null，可选，同上"
 }
 ```
 
@@ -354,14 +384,15 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `ok` | bool | 恒为 `true`(失败走错误结构,不回此体) |
+| `ok` | bool | 恒为 `true`(失败走 1.5 错误结构,不回此体) |
 | `question` | string | 用户原始问题 |
-| `answer` | string | 回答正文(Markdown);敏感拒绝时为固定文案 |
-| `sql` | string \| null | 最后一轮工具调用提取的 SQL;无则为 null |
-| `error` | null | 成功恒为 null(兼容字段) |
+| `answer` | string | 回答正文(Markdown):首部为查询结果数据表格(≤20 行,列头优先中文别名),后接简短解释;敏感拒绝时为固定文案 |
 | `data` | object | `{columns: [string], column_aliases: {string: string}, rows: [[any]], row_count: int, truncated: bool}`,无查询结果时为空结构;`column_aliases` 为列名中文别名表(见 6.4) |
 | `chart` | object | 图表建议,见 3.4 |
-| `steps` | array | 工具调用过程,见 3.5 |
+
+不再回传的字段:SQL、工具调用过程 `steps`(流式步骤由 SSE 事件实时透出)、token 用量与耗时(仅服务端日志,见 6.3)、`error`(仅出错时经 1.5 错误结构返回)。
+
+透传回显字段:请求携带的 `request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question` 在响应体中原封不动回显(未携带的字段不出现);`question` 始终为用户原始问题;实际以哪个问题作答由智能体判断(resolved_question 非空时两者一并交给智能体),图表推荐按 resolved_question(如有)判断。
 
 ### 3.4 ChartSuggestion(图表建议)
 
@@ -372,15 +403,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 | `reason` | string | 推断理由 |
 | `column_kinds` | array | 逐列类型推断(`date`/`number`/`category`),与列一一对应 |
 
-### 3.5 StepSummary(工具调用步骤)
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `tool` | string | 工具名(如 `sql_db_schema`、`sql_db_query`) |
-| `input` | any | 工具输入参数 |
-| `output` | string | 工具输出,**截断到 300 字**(超长补 ` …(已截断)`) |
-
-### 3.6 SessionSummary(会话列表项)
+### 3.5 SessionSummary(会话列表项)
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -391,7 +414,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 | `updated_at` | string | 最近更新时间(ISO 8601, UTC) |
 | `message_count` | int | 消息总条数 |
 
-### 3.7 HistoryMessage(回放消息)
+### 3.6 HistoryMessage(回放消息)
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -496,11 +519,8 @@ uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2
     "ok": true,
     "question": "查一下用户的密码",
     "answer": "出于数据安全与隐私保护要求，系统不会执行涉及密码、密钥、认证令牌、身份证号、手机号、邮箱地址等敏感隐私字段的查询。请调整您的问题，避免涉及上述敏感隐私数据后重试。",
-    "sql": null,
-    "error": null,
     "data": {"columns": [], "column_aliases": {}, "rows": [], "row_count": 0, "truncated": false},
-    "chart": {"chartable": false, "chart_type": null, "reason": "没有可用的查询结果数据", "column_kinds": []},
-    "steps": []
+    "chart": {"chartable": false, "chart_type": null, "reason": "没有可用的查询结果数据", "column_kinds": []}
   }
   ```
 
