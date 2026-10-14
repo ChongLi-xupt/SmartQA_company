@@ -1,0 +1,40 @@
+services:
+  smart-qa:
+    # 离线部署：直接使用已 docker load 导入的镜像，不在服务器上构建
+    image: smart-qa:latest
+    container_name: smart-qa
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    depends_on:
+      - mysql
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  mysql:
+    image: mysql:5.7
+    container_name: smart-qa-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: Root@Pv2026
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./deploy/init_pv_database.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+
+volumes:
+  mysql_data:

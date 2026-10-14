@@ -1,0 +1,30 @@
+# 凭据与本地配置，绝不进入镜像
+.env
+
+# 用户反馈数据（运行时生成）
+feedback.jsonl
+
+# Python 缓存与产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试与缓存
+.pytest_cache/
+.ruff_cache/
+tests/
+
+# IDE
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore
+
+# 部署文件本身无需进镜像
+Dockerfile
+docker-compose.yml
+.dockerignore

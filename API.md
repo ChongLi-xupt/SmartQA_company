@@ -108,7 +108,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 
 - **认证**:需要(`X-API-Key`,未配置 `WEB_API_KEYS` 时免)
 - **限流**:`RATE_LIMIT_ASK`(默认 20 次/分钟)
-- **请求体**(`AskRequest`):
+- **请求体**(`AskRequest`,**`question` 为唯一必填字段**,其余全部可选,并允许携带契约外的额外字段):
 
   | 字段 | 类型 | 必填 | 校验规则 |
   |---|---|---|---|
@@ -135,7 +135,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
   ```
 
   - **问题选择**:`resolved_question` 非空时与 `question` 一并交给智能体,由智能体判断哪个可以直接使用(改写问题指代完整、意图清晰时优先按它作答,明显不可用时回退原始问题);敏感词拦截对两个问题同时生效;回答/历史/回显的 `question` 字段始终为用户原始问题
-  - **透传回显**:`request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question` 不参与查询逻辑,请求携带时在响应中原封不动回显(未携带的字段不出现,不以 null 占位)
+  - **透传回显**:透传参数(`request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question`)与契约外额外字段一视同仁——不参与查询逻辑,请求中**有数据(非 null/空串)就在响应中原封不动回显,没数据则字段不出现**(不以 null 占位);基础必回字段 `ok` / `question` / `answer` / `data` / `chart` 恒返回,同名传入字段不会将其覆盖
 
   `user_id` 为用户标识(前端自动生成或业务系统下发),首轮问答成功写入历史时把会话归属到该用户(归属首次写入即固定,不可被后续请求改挂);会话列表接口可据此按用户隔离展示(见 2.3)。
 
@@ -356,6 +356,8 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 
 ### 3.1 AskRequest(提问请求体)
 
+`question` 为唯一必填字段,其余全部可选;允许携带契约外额外字段(`extra="allow"`),与透传参数同样规则回显。
+
 ```json
 {
   "question": "string，必填，strip 后非空且 ≤ 500 字",
@@ -392,7 +394,7 @@ IP 提取规则:优先取 `X-Forwarded-For` 首段,否则取直连 IP,均无则�
 
 不再回传的字段:SQL、工具调用过程 `steps`(流式步骤由 SSE 事件实时透出)、token 用量与耗时(仅服务端日志,见 6.3)、`error`(仅出错时经 1.5 错误结构返回)。
 
-透传回显字段:请求携带的 `request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question` 在响应体中原封不动回显(未携带的字段不出现);`question` 始终为用户原始问题;实际以哪个问题作答由智能体判断(resolved_question 非空时两者一并交给智能体),图表推荐按 resolved_question(如有)判断。
+透传回显字段:请求携带的 `request_id` / `conversation_id` / `turn_id` / `trace_id` / `user_id` / `resolved_question` 及契约外额外字段,有数据(非 null/空串)时在响应体中原封不动回显,没数据则字段不出现;基础必回字段 `ok` / `question` / `answer` / `data` / `chart` 恒返回且不被同名传入字段覆盖。`question` 始终为用户原始问题;实际以哪个问题作答由智能体判断(resolved_question 非空时两者一并交给智能体),图表推荐按 resolved_question(如有)判断。
 
 ### 3.4 ChartSuggestion(图表建议)
 

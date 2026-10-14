@@ -59,12 +59,19 @@ def test_golden_sensitive_entries_rejected():
 
     client = TestClient(app.app)
     sensitive = [e for e in _load_entries() if e.get("expect_rejected")]
-    for entry in sensitive:
-        response = client.post("/api/v1/ask", json={"question": entry["question"]})
-        assert response.status_code == 200, entry["question"]
-        payload = response.json()
-        assert payload["ok"] is True, entry["question"]
-        assert "敏感" in payload["answer"] or "隐私" in payload["answer"], entry["question"]
+    # 放开限流配额：进程内限流器与其他测试模块共享同一 "testclient" 桶，
+    # 避免前面的用例耗尽每分钟配额后本用例误触 429
+    original_max_calls = app._ask_limiter.max_calls
+    app._ask_limiter.max_calls = 10**9
+    try:
+        for entry in sensitive:
+            response = client.post("/api/v1/ask", json={"question": entry["question"]})
+            assert response.status_code == 200, entry["question"]
+            payload = response.json()
+            assert payload["ok"] is True, entry["question"]
+            assert "敏感" in payload["answer"] or "隐私" in payload["answer"], entry["question"]
+    finally:
+        app._ask_limiter.max_calls = original_max_calls
 
 
 if __name__ == "__main__":

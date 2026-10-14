@@ -1,5 +1,10 @@
 # 凭据与本地配置，严禁提交
 .env
+.env.production
+.env.local
+
+# Docker 镜像归档（体积大，不进仓库）
+*.tar
 
 # 用户反馈数据（含提问内容，属用户数据）
 feedback.jsonl

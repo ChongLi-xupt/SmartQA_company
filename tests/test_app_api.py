@@ -23,6 +23,12 @@ import app  # noqa: E402  需在环境变量就绪后导入
 
 _client = TestClient(app.app)
 
+# 进程内限流器按 IP 共享，整个测试会话的用例都命中同一 "testclient" 桶：
+# 放开每分钟配额，避免用例数量增长后按执行顺序相互干扰（无用例断言 429）。
+app._ask_limiter.max_calls = 10**9
+app._new_chat_limiter.max_calls = 10**9
+app._feedback_limiter.max_calls = 10**9
+
 
 def test_index_page():
     response = _client.get("/")
@@ -381,6 +387,56 @@ def test_ask_without_new_fields_stays_slim(monkeypatch):
             assert field not in payload
     finally:
         app._history_store.delete_session(session_id)
+
+
+def test_ask_echoes_extra_fields_and_skips_empty(monkeypatch):
+    # 契约外字段有数据也原样回显；空值（null/空串）不回显；
+    # 基础必回字段恒在，且不被同名传入字段覆盖
+    captured = {}
+    monkeypatch.setattr(app, "get_qa", lambda: _FakeQA(captured))
+    session_id = _client.post("/api/v1/new_chat").json()["session_id"]
+    try:
+        response = _client.post(
+            "/api/v1/ask",
+            json={
+                "question": "其中哪个销量最高？",
+                "channel": "web",
+                "seq_no": 3,
+                "ext": {"source": "portal"},
+                "request_id": "",
+                "trace_id": None,
+                "answer": "恶意覆盖",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        # 基础必回字段恒在
+        for field in ("ok", "question", "answer", "data", "chart"):
+            assert field in payload
+        assert set(payload["data"]) == {
+            "columns", "column_aliases", "rows", "row_count", "truncated"
+        }
+        assert set(payload["chart"]) == {
+            "chartable", "chart_type", "reason", "column_kinds"
+        }
+        # 契约外字段有数据原样回显
+        assert payload["channel"] == "web"
+        assert payload["seq_no"] == 3
+        assert payload["ext"] == {"source": "portal"}
+        # 空值字段不回显
+        assert "request_id" not in payload
+        assert "trace_id" not in payload
+        # 同名字段不能覆盖基础必回字段
+        assert payload["answer"] != "恶意覆盖"
+    finally:
+        app._history_store.delete_session(session_id)
+
+
+def test_ask_missing_question_rejected():
+    # question 为唯一必填字段：缺失时 400
+    response = _client.post("/api/v1/ask", json={"request_id": "REQ001"})
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
 
 
 def test_ask_sensitive_resolved_question_rejected():

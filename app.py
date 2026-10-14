@@ -54,7 +54,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from itsdangerous import BadSignature, URLSafeTimedSerializer
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -389,12 +389,19 @@ _MAX_PASSTHROUGH_ID_LENGTH = 128
 class AskRequest(BaseModel):
     """POST /ask 与 /ask_stream 的请求体。
 
+    字段约束：question 为唯一必填字段；其余契约字段全部可选，
+    并允许携带契约外的额外字段（extra="allow"）。
+
     上游集成契约：question 为用户原始问题；resolved_question 为上游完成
     指代消解后的独立问题，非空时与 question 一并交给智能体，由智能体
     判断哪个可用作问题输入；其余标识字段
     （request_id/conversation_id/turn_id/trace_id/user_id）为透传参数，
-    不参与查询逻辑，响应中原封不动回显。
+    不参与查询逻辑。透传参数与契约外字段一视同仁：请求中有数据
+    （非 null/空串）就在响应中原封不动回显，没数据则不出现在响应中。
     """
+
+    # 契约外字段不丢弃：随请求收下，响应时原样回显（见 _merge_passthrough）
+    model_config = ConfigDict(extra="allow")
 
     question: str
     # 上游指代消解结果：与 question 一并交给智能体判断取舍（空串归一为 None）
@@ -646,8 +653,7 @@ def _markdown_data_table(
     return "\n".join(lines)
 
 
-# 上游透传参数（总项目集成契约）：响应中原封不动回显，不参与查询逻辑；
-# 仅回显请求中实际携带的字段，避免未传字段以 null 占位
+# 上游透传参数（总项目集成契约）：有数据才回显，不参与查询逻辑
 _PASSTHROUGH_FIELDS = (
     "request_id",
     "conversation_id",
@@ -661,10 +667,19 @@ _PASSTHROUGH_FIELDS = (
 def _merge_passthrough(
     payload: dict[str, Any], request_body: AskRequest
 ) -> dict[str, Any]:
-    """把请求携带的透传参数原样写回响应体（就地修改并返回 payload）。"""
-    for field in _PASSTHROUGH_FIELDS:
-        value = getattr(request_body, field, None)
-        if value:
+    """把请求携带的透传参数原样写回响应体（就地修改并返回 payload）。
+
+    契约字段与契约外额外字段（AskRequest extra="allow"）一视同仁：
+    有数据（非 null/空串）才回显，未传或空值字段不出现在响应中；
+    基础必回字段（ok/question/answer/data/chart）已先行组装，
+    任何同名传入字段都不会将其覆盖。
+    """
+    candidates: list[tuple[str, Any]] = [
+        (field, getattr(request_body, field, None)) for field in _PASSTHROUGH_FIELDS
+    ]
+    candidates.extend((request_body.model_extra or {}).items())
+    for field, value in candidates:
+        if value is not None and value != "" and field not in payload:
             payload[field] = value
     return payload
 
